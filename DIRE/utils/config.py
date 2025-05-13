@@ -57,8 +57,8 @@ class DefaultConfigs(ABC):
 
     # paths information
     # root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    root_dir = "/home/ubuntu/projects"
-    dataset_root = os.path.join(root_dir, "data")
+    root_dir = "/Users/yatharthgupta/vscode/PatternProject"
+    dataset_root = os.path.join(root_dir, "data/4")
     exp_root = os.path.join(root_dir, "data", "exp")
     _exp_name = ""
     exp_dir = ""

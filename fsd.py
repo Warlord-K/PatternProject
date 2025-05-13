@@ -2,21 +2,51 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, Sampler
-from torchvision import transforms, datasets, models
+from torchvision import transforms, models
 from PIL import Image
 import numpy as np
 import os
 import random
+import pandas as pd
 from collections import defaultdict
-import math
+import argparse
+from tqdm import tqdm
+
+class CSVImageDataset(Dataset):
+    def __init__(self, csv_path, data_root, transform=None):
+        self.data_root = data_root
+        self.transform = transform
+        self.df = pd.read_csv(csv_path)
+        self.samples = []
+        self.targets = []
+        self.class_to_idx = {0: 0, 1: 1}
+        self.classes = ['AI-generated', 'Real']
+        
+        for _, row in self.df.iterrows():
+            file_path = os.path.join(data_root, row['file_name'])
+            if os.path.exists(file_path):
+                self.samples.append((file_path, row['label']))
+                self.targets.append(row['label'])
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
 
 class FsdModel(nn.Module):
     def __init__(self, out_dim=1024):
         super().__init__()
         rn = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        self.enc = nn.Sequential(*list(rn.children())[:-1]) # Remove final fc
-        in_feat = rn.fc.in_features # Should be 2048
-        self.proj = nn.Linear(in_feat, out_dim) # Project to 1024
+        self.enc = nn.Sequential(*list(rn.children())[:-1])
+        in_feat = rn.fc.in_features
+        self.proj = nn.Linear(in_feat, out_dim)
 
     def forward(self, x):
         emb = self.enc(x)
@@ -43,14 +73,12 @@ class EpisodicBatchSampler(Sampler):
              if len(self.cls_indices[c]) < n_spt + n_qry:
                   print(f"Warning: Class {c} has only {len(self.cls_indices[c])} samples, less than n_spt+n_qry={n_spt+n_qry}")
 
-
     def __iter__(self):
         for _ in range(self.iterations):
             sel_cls = random.sample(self.avail_cls, self.n_cls)
             batch_idxs = []
             for c in sel_cls:
                 cls_idxs = self.cls_indices[c]
-                # Ensure enough samples, sample with replacement if necessary
                 req_samples = self.n_spt + self.n_qry
                 if len(cls_idxs) < req_samples:
                     sampled = random.choices(cls_idxs, k=req_samples)
@@ -78,9 +106,9 @@ def train_proto(model, dl, opt, n_spt, n_qry, n_cls, dev):
     tot_acc = 0.0
     crit = nn.NLLLoss()
 
-    for batch in dl:
+    for batch in tqdm(dl):
         opt.zero_grad()
-        data, _ = batch # Labels are implicit in the sampling order
+        data, _ = batch
         data = data.to(dev)
         p = n_spt * n_cls
         data_spt, data_qry = data[:p], data[p:]
@@ -94,7 +122,6 @@ def train_proto(model, dl, opt, n_spt, n_qry, n_cls, dev):
 
         log_p_y = nn.functional.log_softmax(-dists, dim=1)
 
-        # Create query labels (0, 0, ..., 1, 1, ..., N-1, N-1, ...)
         lbl_qry = torch.arange(n_cls).view(n_cls, 1).expand(n_cls, n_qry).reshape(-1)
         lbl_qry = lbl_qry.to(dev)
 
@@ -158,92 +185,126 @@ def test_proto(model, ds, n_way, k_shot, n_query_test, n_episodes, dev):
 
     return tot_acc / n_episodes * 100
 
+def split_dataset(dataset, train_size=8000, test_size=800, random_seed=42):
+    random.seed(random_seed)
+    
+    class_indices = {0: [], 1: []}
+    for idx, (_, label) in enumerate(dataset.samples):
+        class_indices[label].append(idx)
+    
+    train_indices = []
+    test_indices = []
+    
+    for label, indices in class_indices.items():
+        random.shuffle(indices)
+        train_per_class = train_size // 2
+        test_per_class = test_size // 2
+        
+        if len(indices) < train_per_class + test_per_class:
+            raise ValueError(f"Not enough samples for class {label}: {len(indices)} < {train_per_class + test_per_class}")
+        
+        train_indices.extend(indices[:train_per_class])
+        test_indices.extend(indices[train_per_class:train_per_class + test_per_class])
+    
+    from torch.utils.data import Subset
+    train_subset = Subset(dataset, train_indices)
+    test_subset = Subset(dataset, test_indices)
+    
+    return train_subset, test_subset
 
-# --- Config ---
-data_dir = './data' # CHANGE THIS to your dataset path (e.g., './genimage')
-n_way_train = 3 # Nc in paper (Number of classes per episode)
-k_shot_train = 5 # Ns in paper (Support samples per class)
-n_query_train = 5 # Nq in paper (Query samples per class)
-train_iterations = 1000 # Number of episodes per epoch
-epochs = 10 # Number of epochs (each epoch runs train_iterations episodes)
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--csv_path', type=str, default='/Users/yatharthgupta/vscode/PatternProject/data/4/train.csv', help='path to csv file')
+    parser.add_argument('--data_root', type=str, default='/Users/yatharthgupta/vscode/PatternProject/data/4', help='path to image data root')
+    parser.add_argument('--save_path', type=str, default='./fsd.pth', help='path to save model')
+    parser.add_argument('--train_size', type=int, default=8000, help='number of training images')
+    parser.add_argument('--test_size', type=int, default=800, help='number of test images')
+    parser.add_argument('--seed', type=int, default=42, help='random seed')
+    parser.add_argument('--epochs', type=int, default=10, help='number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+    return parser.parse_args()
 
-n_way_test = 2 # N-way for testing (e.g., 2 for Real vs Fake_X)
-k_shot_test = 10 # K-shot for testing
-n_query_test = 15 # Query samples per class for testing
-test_episodes = 600 # Number of test episodes
-
-lr = 1e-4
-# -------------
-
-dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {dev}")
-
-tf_train = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.RandomCrop(224),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-tf_test = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-print("Loading data...")
-try:
-    train_ds = datasets.ImageFolder(os.path.join(data_dir, 'train'), transform=tf_train)
-    test_ds = datasets.ImageFolder(os.path.join(data_dir, 'test'), transform=tf_test)
-
-    if len(train_ds) == 0 or len(test_ds) == 0:
-         raise ValueError("Datasets are empty. Check data_dir structure.")
-    if len(train_ds.classes) <= n_way_train:
-        raise ValueError(f"Need more than {n_way_train} classes in training set for episodic sampling.")
-
-    print(f"Train classes: {train_ds.classes}")
-    print(f"Test classes: {test_ds.classes}")
-
-    train_sampler = EpisodicBatchSampler(train_ds.targets, n_way_train, k_shot_train, n_query_train, train_iterations)
-    # Batch size must be n_way * (k_shot + n_query) for the sampler to work correctly
+def main():
+    args = parse_args()
+    
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    
+    n_way_train = 2
+    k_shot_train = 5
+    n_query_train = 5
+    train_iterations = 1000
+    epochs = args.epochs
+    
+    n_way_test = 2
+    k_shot_test = 10
+    n_query_test = 15
+    test_episodes = 200
+    
+    lr = args.lr
+    
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        dev = torch.device("mps")
+    print(f"Using device: {dev}")
+    
+    tf_train = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    tf_test = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    print(f"Loading data from {args.csv_path}...")
+    full_dataset = CSVImageDataset(args.csv_path, args.data_root, transform=tf_train)
+    
+    print(f"Dataset loaded with {len(full_dataset)} images")
+    print(f"Class distribution: {sum(1 for _, lbl in full_dataset.samples if lbl == 0)} AI-generated, "
+          f"{sum(1 for _, lbl in full_dataset.samples if lbl == 1)} Real")
+    
+    train_ds, test_ds = split_dataset(full_dataset, args.train_size, args.test_size, args.seed)
+    
+    print(f"Split into {len(train_ds)} training and {len(test_ds)} test samples")
+    
+    train_sampler = EpisodicBatchSampler(
+        [train_ds.dataset.samples[i][1] for i in train_ds.indices], 
+        n_way_train, k_shot_train, n_query_train, train_iterations
+    )
+    
     train_batch_sz = n_way_train * (k_shot_train + n_query_train)
     train_dl = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=2)
+    
+    print("Initializing model...")
+    mod = FsdModel(out_dim=1024).to(dev)
+    opt = optim.Adam(mod.parameters(), lr=lr)
+    sched = optim.lr_scheduler.StepLR(opt, step_size=80000, gamma=0.5)
+    
+    print("Starting training...")
+    for ep in range(epochs):
+        print(f"Epoch {ep+1}/{epochs}")
+        avg_loss, avg_acc = train_proto(mod, train_dl, opt, k_shot_train, n_query_train, n_way_train, dev)
+        
+        print(f"Epoch {ep+1}/{epochs} -> Avg Loss: {avg_loss:.4f}, Avg Train Acc: {avg_acc:.2f}%")
+        
+        if (ep + 1) % 5 == 0 or ep == epochs - 1:
+            test_acc = test_proto(mod, test_ds.dataset, n_way_test, k_shot_test, n_query_test, test_episodes, dev)
+            print(f"  --> Test Acc ({n_way_test}-way {k_shot_test}-shot): {test_acc:.2f}%")
+    
+    print("Training finished.")
+    final_test_acc = test_proto(mod, test_ds.dataset, n_way_test, k_shot_test, n_query_test, test_episodes, dev)
+    print(f"Final Test Acc ({n_way_test}-way {k_shot_test}-shot): {final_test_acc:.2f}%")
+    
+    torch.save(mod.state_dict(), args.save_path)
+    print(f"Model saved to {args.save_path}")
 
-except FileNotFoundError:
-    print(f"Error: Data directory '{data_dir}' not found or incorrectly structured.")
-    print("Ensure 'train' and 'test' subfolders exist, each with class subdirectories.")
-    exit()
-except ValueError as ve:
-    print(f"Error: {ve}")
-    exit()
-except Exception as e:
-    print(f"An unexpected error occurred during data loading: {e}")
-    exit()
-
-print("Initializing model...")
-mod = FsdModel(out_dim=1024).to(dev)
-opt = optim.Adam(mod.parameters(), lr=lr)
-# Scheduler from paper: StepLR(gamma=0.5, step_size=80000) - apply per step/iteration, not epoch
-sched = optim.lr_scheduler.StepLR(opt, step_size=80000, gamma=0.5)
-
-print("Starting training...")
-for ep in range(epochs):
-    avg_loss, avg_acc = train_proto(mod, train_dl, opt, k_shot_train, n_query_train, n_way_train, dev)
-    # Note: Scheduler step should ideally be called after each optimizer step within train_proto if step_size refers to iterations.
-    # Calling it per epoch here for simplicity, adjust if needed based on paper's intent for 'step=80000'.
-    # sched.step() # Uncomment if step refers to epochs
-
-    print(f"Epoch {ep+1}/{epochs} -> Avg Loss: {avg_loss:.4f}, Avg Train Acc: {avg_acc:.2f}%")
-
-    if (ep + 1) % 5 == 0: # Evaluate every 5 epochs
-        test_acc = test_proto(mod, test_ds, n_way_test, k_shot_test, n_query_test, test_episodes, dev)
-        print(f"  --> Test Acc ({n_way_test}-way {k_shot_test}-shot): {test_acc:.2f}%")
-
-
-print("Training finished.")
-final_test_acc = test_proto(mod, test_ds, n_way_test, k_shot_test, n_query_test, test_episodes, dev)
-print(f"Final Test Acc ({n_way_test}-way {k_shot_test}-shot): {final_test_acc:.2f}%")
-
-# torch.save(mod.state_dict(), 'fsd_model.pth')
+if __name__ == "__main__":
+    main()
